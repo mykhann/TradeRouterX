@@ -24,7 +24,34 @@ function validateOrder(order) {
   }
 }
 
+// Load & cache config
+async function loadConfig() {
+  if (configCache) return configCache;
+  const data = await s3.send(new GetObjectCommand({
+    Bucket: CONFIG_BUCKET,
+    Key: CONFIG_KEY
+  }));
+  const body = await new Promise((res, rej) => {
+    const chunks = [];
+    data.Body.on('data', c => chunks.push(c));
+    data.Body.on('error', rej);
+    data.Body.on('end', () => res(Buffer.concat(chunks).toString('utf8')));
+  });
+  configCache = JSON.parse(body);
+  return configCache;
+}
 
+async function sendAlert(subject, message) {
+  await sns.send(new PublishCommand({
+    TopicArn: SNS_TOPIC_ARN,
+    Subject: subject,
+    Message: message
+  }));
+}
+// Exponential backoff
+const delay = ms => new Promise(res => setTimeout(res, ms));
+// Unique trade ID
+const generateTradeId = () => crypto.randomBytes(8).toString('hex');
 
   return {
     statusCode: 200,
