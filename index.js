@@ -53,6 +53,32 @@ const delay = ms => new Promise(res => setTimeout(res, ms));
 // Unique trade ID
 const generateTradeId = () => crypto.randomBytes(8).toString('hex');
 
+// DynamoDB logger
+async function logTradeToDynamo({ firmId, accountId, action, symbol, qty, fillPrice, errorMessage, orderId }) {
+  const item = {
+    tradeId: { S: generateTradeId() },
+    timestamp: { S: new Date().toISOString() },
+    firmId: { S: firmId },
+    accountId: { S: accountId.toString() },
+    action: { S: action },
+    symbol: { S: symbol },
+    orderId: { S: orderId.toString() },
+    fillPrice: fillPrice != null
+      ? { N: fillPrice.toString() }
+      : { NULL: true },
+    quantity: { N: qty.toString() },
+    note: errorMessage ? { S: errorMessage } : { NULL: true }
+  };
+  try {
+    await dynamo.send(new PutItemCommand({
+      TableName: process.env.DYNAMO_TABLE,
+      Item: item
+    }));
+  } catch (err) {
+    console.error('DynamoDB write failed', err.message);
+  }
+}
+
   return {
     statusCode: 200,
     headers: { 'Content-Type': 'application/json' },
