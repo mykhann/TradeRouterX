@@ -79,6 +79,28 @@ async function logTradeToDynamo({ firmId, accountId, action, symbol, qty, fillPr
   }
 }
 
+// Tradovate token caching
+let tradovateToken = null, tokenExpiry = 0;
+async function getTradovateAccessToken() {
+  if (tradovateToken && tokenExpiry > Date.now()) {
+    return tradovateToken;
+  }
+  const authPayload = {
+    name: process.env.TRADOVATE_USERNAME,
+    password: process.env.TRADOVATE_PASSWORD,
+    appId: process.env.TRADOVATE_APP_ID,
+    appVersion: process.env.TRADOVATE_APP_VERSION,
+    deviceId: process.env.TRADOVATE_DEVICE_ID,
+    cid: process.env.TRADOVATE_CLIENT_ID,
+    sec: process.env.TRADOVATE_CLIENT_SECRET
+  };
+  const { data } = await axios.post(process.env.TRADOVATE_AUTH_URL, authPayload);
+  tradovateToken = data.accessToken;
+  tokenExpiry = Date.now() + (data.expirationTime || 8 * 60 * 1000);
+  return tradovateToken;
+}
+
+
   return {
     statusCode: 200,
     headers: { 'Content-Type': 'application/json' },
