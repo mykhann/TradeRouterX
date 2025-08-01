@@ -124,6 +124,31 @@ async function getDynamicToken(firmId, cfg) {
   };
   return token;
 }
+async function fetchContractIdFromTheFuturesDesk(symbol, cfg) {
+  const token = await getDynamicToken('thefuturesdesk', cfg);
+  const url = process.env.CONTRACT_ID_URL;
+
+  let data;
+  try {
+    const response = await axios.post(url, { live: false }, {
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`
+      }
+    });
+    data = response.data;
+  } catch (err) {
+    console.error(`Failed to fetch contract ID from TheFuturesDesk for symbol "${symbol}":`, err.response?.data || err.message);
+    throw new Error(`Contract ID fetch failed for ${symbol}`);
+  }
+
+
+  const contracts = data.contracts || [];
+  const contract = contracts.find(c => c.symbolId === symbol || c.name === symbol);
+  if (!contract) throw new Error(`No contract found for symbol: ${symbol}`);
+  return contract.id;
+}
+
 
   return {
     statusCode: 200,
