@@ -1,0 +1,11 @@
+{
+  "name": "trade-executor",
+  "version": "1.0.0",
+  "main": "index.js",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.x",
+    "@aws-sdk/client-sns": "^3.x",
+    "axios": "^1.x",
+    "ws": "^8.18.3"
+  }
+}
