@@ -100,6 +100,30 @@ async function getTradovateAccessToken() {
   return tradovateToken;
 }
 
+const tokenCache = {};
+async function getDynamicToken(firmId, cfg) {
+  const now = Date.now();
+  if (tokenCache[firmId] && tokenCache[firmId].expiry > now) {
+    return tokenCache[firmId].token;
+  }
+
+  const cred = cfg.FirmCredentials?.[firmId];
+  if (!cred) throw new Error(`Missing credentials for ${firmId}`);
+
+  const { tokenEndpoint, userName, apiKey } = cred;
+  const { data } = await axios.post(tokenEndpoint, { userName, apiKey }, {
+    headers: { 'Content-Type': 'application/json' }
+  });
+
+  const token = data.token || data.accessToken;
+  if (!token) throw new Error(`No token returned from ${firmId}`);
+
+  tokenCache[firmId] = {
+    token,
+    expiry: now + ((data.expiresIn || 600) * 1000) // default 10 minutes
+  };
+  return token;
+}
 
   return {
     statusCode: 200,
