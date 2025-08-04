@@ -175,6 +175,49 @@ async function fetchContractIdFromTheFuturesDesk(symbol, cfg) {
   return contract.id;
 }
 
+const payloadBuilders = {
+  projectx: (firm, order, accountId, finalQty) => {
+    if (!firm.contractId) { throw new Error(`Missing contractId for firm ${firm.firmId}`); }
+    return {
+      contractId: firm.contractId,
+      accountId,
+      type: order.orderType === 'Market' ? 2 : 1,
+      side: order.action.toLowerCase() === 'buy' ? 0 : 1,
+      size: finalQty
+    };
+  },
+  tradovate: (firm, order, accountId, finalQty) => {
+    const accountSpec = firm.accountSpec;
+    if (!accountSpec) { throw new Error(`Missing accountSpec for firm ${firm.firmId}`); }
+    return {
+      accountId,
+      accountSpec,
+      action: order.action,
+      symbol: order.symbol,
+      orderQty: finalQty,
+      orderType: order.orderType,
+      isAutomated: true
+    };
+  }
+};
+
+// fetching fill prices for projectXFirms
+async function fetchFillPriceFromConfig(firmId, accountId, orderId, config, token) {
+  const url = config.PriceFillUrls?.[firmId];
+  if (!url) throw new Error(`Fill endpoint not configured for ${firmId}`);
+
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json",
+  };
+
+  const body = { accountId };
+  const res = await axios.post(url, body, { headers });
+  const trades = res.data.trades || [];
+  const match = trades.find(t => String(t.orderId) === String(orderId));
+  return match?.price || null;
+}
+
   return {
     statusCode: 200,
     headers: { 'Content-Type': 'application/json' },
