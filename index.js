@@ -218,6 +218,237 @@ async function fetchFillPriceFromConfig(firmId, accountId, orderId, config, toke
   return match?.price || null;
 }
 
+exports.handler = async (event) => {
+  let body;
+  try {
+    body = JSON.parse(event.body || '{}');
+    console.info('Incoming request :', body);
+  } catch (err) {
+    console.error('Invalid JSON received:', err.message);
+    return { statusCode: 400, body: 'Invalid JSON' };
+  }
+
+  const REQUIRED_PASSWORD = process.env.REQUIRED_PASSWORD;
+  if (body.password !== REQUIRED_PASSWORD) {
+    return {
+      statusCode: 401,
+      body: JSON.stringify({ message: 'Invalid password. Access denied.' })
+    };
+  }
+
+  let orders = [];
+  if (Array.isArray(body.orders)) {
+    orders = body.orders;
+  } else if (body.symbol && body.orderQty && body.orderType && body.action) {
+    orders = [body];
+  } else { return { statusCode: 400, body: 'Missing or invalid order input' }; }
+
+  let cfg;
+  try {
+    cfg = await loadConfig();
+  } catch (err) {
+    console.error('Failed to load config from S3:', err.message);
+    return {
+      statusCode: 500,
+      body: 'Server error: Could not load configuration'
+    };
+  }
+
+  for (const order of orders) {
+    try {
+      validateOrder(order);
+    } catch (err) {
+      return { statusCode: 400, body: err.message };
+    }
+    order.symbol = order.symbol.toUpperCase();
+    order.action = order.action.charAt(0).toUpperCase() + order.action.slice(1).toLowerCase();
+    order.orderType = order.orderType.charAt(0).toUpperCase() + order.orderType.slice(1).toLowerCase();
+    const { symbol, orderQty, action, orderType, price } = order;
+    const firms = cfg[symbol] || [];
+    console.info(`Found ${firms.length} firm(s) configured for symbol "${symbol}":`, firms.map(f => f.firmId));
+
+    if (!firms.length) {
+      const msg = `No trading firm is configured for symbol "${symbol}".`;
+      console.warn(msg)
+      return {
+        statusCode: 400,
+        body: JSON.stringify({ message: msg })
+      }
+    }
+
+    const projectXFirms = firms.filter(firm => Object.keys(cfg.Urls.projectx || {}).includes(firm.firmId));
+    if (projectXFirms.length) {
+      try {
+        const sharedContractId = await fetchContractIdFromTheFuturesDesk(symbol, cfg);
+        projectXFirms.forEach(firm => {
+          firm.contractId = sharedContractId;
+        });
+      } catch (err) {
+        console.error('Could not fetch shared ProjectX contractId:', err.message);
+      }
+    }
+
+    for (const firm of firms) {
+      const projxUrlMap = cfg.Urls.projectx || {};
+      const isProjectXSub = Boolean(projxUrlMap[firm.firmId]);
+      const builderKey = isProjectXSub ? 'projectx' : firm.firmId;
+      const builder = payloadBuilders[builderKey];
+
+      if (!builder) {
+        console.warn(`Configuration for firm "${firm.firmId}" is incomplete or unsupported.`);
+        continue;
+      }
+
+      const baseUrl = isProjectXSub
+        ? projxUrlMap[firm.firmId]
+        : cfg.Urls[firm.firmId];
+      if (!baseUrl) {
+        console.error(`Missing URL for firm ${firm.firmId}`);
+        continue;
+      }
+
+      for (const accountId of firm.accountIds) {
+        const finalQty = firm.size * orderQty;
+        let orderPayload;
+        try {
+          orderPayload = builder(firm, order, accountId, finalQty);
+        } catch (err) {
+          console.error(`Payload error for ${firm.firmId}/${accountId}:`, err.message);
+          continue;
+        }
+
+        const headers = { 'Content-Type': 'application/json' };
+        if (firm.firmId === 'tradovate') {
+          headers.Authorization = `Bearer ${await getTradovateAccessToken()}`;
+        } else if (cfg.FirmCredentials?.[firm.firmId]) {
+          headers.Authorization = `Bearer ${await getDynamicToken(firm.firmId, cfg)}`;
+        }
+        let success = false, errMsg = null;
+        let lastError = 'Unknown error';
+        let lastResponse = null;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            const resp = await axios.post(baseUrl, orderPayload, { headers });
+            console.info(`Sending order to ${firm.firmId}/${accountId}:`, {
+              url: baseUrl,
+              payload: orderPayload
+            });
+            console.log('Order response:', resp.data)
+            const orderId = resp.data.orderId || resp.data.id || resp.data.OrderID;
+            let fillPrice = null;
+
+            if (firm.firmId === 'tradovate' && orderId) {
+              try {
+                const fillResp = await axios.get(
+                  `${process.env.FILL_URL}?masterid=${orderId}`,
+                  { headers }
+                );
+
+                const fills = fillResp.data;
+                if (Array.isArray(fills) && fills.length > 0) {
+                  fillPrice = fills[0].price;
+                }
+              } catch (err) {
+                console.error('Error fetching fill price (Tradovate):', err.response?.data || err.message);
+              }
+            }
+
+            else if (cfg.PriceFillUrls?.[firm.firmId] && orderId) {
+              try {
+                const dynamicToken = await getDynamicToken(firm.firmId, cfg);
+
+                fillPrice = await fetchFillPriceFromConfig(
+                  firm.firmId,
+                  accountId,
+                  orderId,
+                  cfg,
+                  dynamicToken
+                );
+
+              } catch (err) {
+                console.warn(`Fill price not found for ${firm.firmId}/${accountId}:`, err.message);
+              }
+            }
+
+            if (resp.data?.success !== false) {
+              let shouldNotify = true;
+              if (firm.firmId === 'tradovate') {
+                const isFilled = await isTradovateOrderFilled(orderId);
+                if (!isFilled) {
+                  console.warn(`Tradovate order ${orderId} not found in fill list—skipping success alert.`);
+                  shouldNotify = false;
+                }
+              }
+
+              if (shouldNotify) {
+                success = true;
+                console.info(
+                  `[ ORDER SUCCESS] ${firm.firmId}/${accountId} | ${action} ${finalQty} ${symbol} @ ${fillPrice || 'MKT'} | OrderID: ${orderId || 'N/A'}`
+                );
+
+                await sendAlert(
+                  'Trade Executed',
+                  `Trade executed successfully\nFirm ID: ${firm.firmId}\nAccount ID: ${accountId}\nAction: ${action} ${finalQty} ${symbol} @ ${fillPrice || 'MKT'}\nOrder ID: ${orderId || 'N/A'}`
+                );
+
+                await logTradeToDynamo({
+                  firmId: firm.firmId,
+                  accountId,
+                  action,
+                  symbol,
+                  qty: finalQty,
+                  fillPrice: fillPrice,
+                  status: 'SUCCESS',
+                  orderId,
+                  strategy:order.strategy
+                });
+
+                break;
+              }
+            }
+
+            throw new Error(resp.data.errorMessage || resp.data.message || 'Unknown failure');
+          } catch (err) {
+            if (err.response) {
+              errMsg = JSON.stringify(err.response.data);
+              console.error(`Attempt ${attempt} HTTP ${err.response.status}:`, err.response.data);
+            } else {
+              errMsg = err.message;
+              console.error(`Attempt ${attempt} error:`, errMsg);
+            }
+            if (attempt < 3) await delay(2 ** attempt * 300);
+          }
+        }
+        if (!success) {
+          const contractNote = firm.contractId ? ` | Contract: ${firm.contractId}` : '';
+          console.error(` Unfortunately all the retries failed for your order for : Firm-ID :  ${firm.firmId}, Acc-ID : ${accountId} Contract-ID:${contractNote}`);
+          await sendAlert(
+            'Trade Failure - Retries Exhausted',
+            `Order failed: Tried multiple times but could not place the order for Firm: ${firm.firmId}, Account: ${accountId}${contractNote}`
+          );
+
+          await logTradeToDynamo({
+            firmId: firm.firmId,
+            accountId,
+            action,
+            symbol,
+            qty: finalQty,
+            price,
+            errorMessage: errMsg,
+            strategy: order.strategy
+          });
+        }
+      }
+    }
+  }
+
+  return {
+    statusCode: 200,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message: 'Trade Executed.' })
+  };
+};
+
   return {
     statusCode: 200,
     headers: { 'Content-Type': 'application/json' },
