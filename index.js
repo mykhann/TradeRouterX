@@ -3,6 +3,8 @@ const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { DynamoDBClient, PutItemCommand } = require('@aws-sdk/client-dynamodb');
 const axios = require('axios');
 const crypto = require('crypto');
+const { performance } = require('perf_hooks');
+
 
 // AWS SDK clients
 const s3 = new S3Client();
@@ -41,6 +43,7 @@ async function loadConfig() {
   return configCache;
 }
 
+// SNS alert helper
 async function sendAlert(subject, message) {
   await sns.send(new PublishCommand({
     TopicArn: SNS_TOPIC_ARN,
@@ -48,26 +51,31 @@ async function sendAlert(subject, message) {
     Message: message
   }));
 }
+
 // Exponential backoff
 const delay = ms => new Promise(res => setTimeout(res, ms));
 // Unique trade ID
 const generateTradeId = () => crypto.randomBytes(8).toString('hex');
 
 // DynamoDB logger
-async function logTradeToDynamo({ firmId, accountId, action, symbol, qty, fillPrice, errorMessage, orderId }) {
+async function logTradeToDynamo({ firmId, accountId, action, symbol, qty, fillPrice, errorMessage, orderId, strategy, executionTime, suggestedPrice }) {
   const item = {
     tradeId: { S: generateTradeId() },
     timestamp: { S: new Date().toISOString() },
     firmId: { S: firmId },
     accountId: { S: accountId.toString() },
     action: { S: action },
+    strategy: strategy ? { S: strategy } : { NULL: true },
     symbol: { S: symbol },
     orderId: { S: orderId.toString() },
     fillPrice: fillPrice != null
       ? { N: fillPrice.toString() }
       : { NULL: true },
+    suggestedPrice: suggestedPrice != null ? { N: suggestedPrice.toString() } : { NULL: true },
     quantity: { N: qty.toString() },
-    note: errorMessage ? { S: errorMessage } : { NULL: true }
+    note: errorMessage ? { S: errorMessage } : { NULL: true },
+    executionTime: executionTime != null ? { N: executionTime.toString() } : { NULL: true },
+
   };
   try {
     await dynamo.send(new PutItemCommand({
@@ -100,6 +108,20 @@ async function getTradovateAccessToken() {
   return tradovateToken;
 }
 
+async function isTradovateOrderFilled(orderId) {
+  const token = await getTradovateAccessToken();
+  try {
+    const { data: fills } = await axios.get(
+      process.env.TRADOVATE_FILL_ORDERS,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    return fills.some(fill => String(fill.orderId) === String(orderId));
+  } catch (err) {
+    console.error('Error fetching Tradovate fills:', err.response?.data || err.message);
+    return false;
+  }
+}
+
 const tokenCache = {};
 async function getDynamicToken(firmId, cfg) {
   const now = Date.now();
@@ -120,33 +142,9 @@ async function getDynamicToken(firmId, cfg) {
 
   tokenCache[firmId] = {
     token,
-    expiry: now + ((data.expiresIn || 600) * 1000) // default 10 minutes
+    expiry: now + ((data.expiresIn || 600) * 1000)
   };
   return token;
-}
-async function fetchContractIdFromTheFuturesDesk(symbol, cfg) {
-  const token = await getDynamicToken('thefuturesdesk', cfg);
-  const url = process.env.CONTRACT_ID_URL;
-
-  let data;
-  try {
-    const response = await axios.post(url, { live: false }, {
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${token}`
-      }
-    });
-    data = response.data;
-  } catch (err) {
-    console.error(`Failed to fetch contract ID from TheFuturesDesk for symbol "${symbol}":`, err.response?.data || err.message);
-    throw new Error(`Contract ID fetch failed for ${symbol}`);
-  }
-
-
-  const contracts = data.contracts || [];
-  const contract = contracts.find(c => c.symbolId === symbol || c.name === symbol);
-  if (!contract) throw new Error(`No contract found for symbol: ${symbol}`);
-  return contract.id;
 }
 
 // Fetch contractId 
@@ -168,13 +166,13 @@ async function fetchContractIdFromTheFuturesDesk(symbol, cfg) {
     throw new Error(`Contract ID fetch failed for ${symbol}`);
   }
 
-
   const contracts = data.contracts || [];
   const contract = contracts.find(c => c.symbolId === symbol || c.name === symbol);
   if (!contract) throw new Error(`No contract found for symbol: ${symbol}`);
   return contract.id;
 }
 
+// Payload builders
 const payloadBuilders = {
   projectx: (firm, order, accountId, finalQty) => {
     if (!firm.contractId) { throw new Error(`Missing contractId for firm ${firm.firmId}`); }
@@ -217,8 +215,9 @@ async function fetchFillPriceFromConfig(firmId, accountId, orderId, config, toke
   const match = trades.find(t => String(t.orderId) === String(orderId));
   return match?.price || null;
 }
-
+// Main Lambda handler
 exports.handler = async (event) => {
+  const lambdaStart = performance.now()
   let body;
   try {
     body = JSON.parse(event.body || '{}');
@@ -298,6 +297,7 @@ exports.handler = async (event) => {
         console.warn(`Configuration for firm "${firm.firmId}" is incomplete or unsupported.`);
         continue;
       }
+      const handlerStart = performance.now();
 
       const baseUrl = isProjectXSub
         ? projxUrlMap[firm.firmId]
@@ -327,6 +327,7 @@ exports.handler = async (event) => {
         let lastError = 'Unknown error';
         let lastResponse = null;
         for (let attempt = 1; attempt <= 3; attempt++) {
+          const tradeStart = performance.now()
           try {
             const resp = await axios.post(baseUrl, orderPayload, { headers });
             console.info(`Sending order to ${firm.firmId}/${accountId}:`, {
@@ -385,11 +386,13 @@ exports.handler = async (event) => {
                 console.info(
                   `[ ORDER SUCCESS] ${firm.firmId}/${accountId} | ${action} ${finalQty} ${symbol} @ ${fillPrice || 'MKT'} | OrderID: ${orderId || 'N/A'}`
                 );
-
+                const tradeEnd = performance.now();
+                const tradeExecutionTime = tradeEnd - tradeStart;
                 await sendAlert(
                   'Trade Executed',
                   `Trade executed successfully\nFirm ID: ${firm.firmId}\nAccount ID: ${accountId}\nAction: ${action} ${finalQty} ${symbol} @ ${fillPrice || 'MKT'}\nOrder ID: ${orderId || 'N/A'}`
                 );
+                const executionTime = Number((performance.now() - handlerStart).toFixed(2));
 
                 await logTradeToDynamo({
                   firmId: firm.firmId,
@@ -398,11 +401,13 @@ exports.handler = async (event) => {
                   symbol,
                   qty: finalQty,
                   fillPrice: fillPrice,
+                  suggestedPrice: order.price,
                   status: 'SUCCESS',
                   orderId,
-                  strategy:order.strategy
-                });
+                  strategy: order.strategy,
+                  executionTime
 
+                });
                 break;
               }
             }
@@ -419,9 +424,11 @@ exports.handler = async (event) => {
             if (attempt < 3) await delay(2 ** attempt * 300);
           }
         }
+
         if (!success) {
           const contractNote = firm.contractId ? ` | Contract: ${firm.contractId}` : '';
-          console.error(` Unfortunately all the retries failed for your order for : Firm-ID :  ${firm.firmId}, Acc-ID : ${accountId} Contract-ID:${contractNote}`);
+          console.error(`Unfortunately all the retries failed for your order for: Firm-ID: ${firm.firmId}, Acc-ID: ${accountId}${contractNote}`);
+
           await sendAlert(
             'Trade Failure - Retries Exhausted',
             `Order failed: Tried multiple times but could not place the order for Firm: ${firm.firmId}, Account: ${accountId}${contractNote}`
@@ -433,25 +440,26 @@ exports.handler = async (event) => {
             action,
             symbol,
             qty: finalQty,
-            price,
+            fillPrice: null,
+            suggestedPrice: order.price,
             errorMessage: errMsg,
-            strategy: order.strategy
+            strategy: order.strategy,
+            orderId: null,
+            executionTime,
+
           });
         }
+
       }
     }
-  }
 
+  }
+  const lambdaEnd = performance.now();
+  const totalLambdaExecutionTime = (lambdaEnd - lambdaStart).toFixed(2);
+  console.info(`Total execution time: ${totalLambdaExecutionTime} ms`);
   return {
     statusCode: 200,
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ message: 'Trade Executed.' })
   };
 };
-
-  return {
-    statusCode: 200,
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message: 'Trade Executed.' })
-  };
-;
